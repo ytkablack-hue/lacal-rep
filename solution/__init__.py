@@ -17,6 +17,7 @@ from .mlp import patch_qwen2_mlp_half
 from .nf4 import patch_bnb_dequantize
 from .residual import patch_qwen2_decoder_residual
 from .rmsnorm import patch_qwen2_rmsnorm
+from .unpad import patch_qwen2_unpad
 
 
 def apply():
@@ -25,3 +26,4 @@ def apply():
     patch_qwen2_rmsnorm()  # fused RMSNorm forward + backward
     patch_qwen2_decoder_residual()  # attention residual add fused into the next RMSNorm
     patch_bnb_dequantize()  # NF4 dequantisation, double-quant decoded in-kernel
+    patch_qwen2_unpad()  # decoder layers run on real tokens only (no padding inside a batch)
