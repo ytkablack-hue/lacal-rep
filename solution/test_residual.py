@@ -1,4 +1,5 @@
-"""Residual add + RMSNorm in one kernel against the separate stock-style ops, forward and backward.
+"""The fused residual add + RMSNorm against the separate ops, and the patched decoder layer against
+the stock one.
 
 Run on a GPU: `python -m pytest solution -q`.
 """
@@ -8,47 +9,78 @@ import torch
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA GPU")
 
-TOLERANCE = {torch.float16: 2e-3, torch.float32: 1e-4}
+TOLERANCE = {torch.float16: 2e-3, torch.float32: 1e-5}
 
 
-@pytest.mark.parametrize("dtypes", [(torch.float32, torch.float16, torch.float32),
-                                    (torch.float32, torch.float32, torch.float32),
-                                    (torch.float16, torch.float16, torch.float16)])
-@pytest.mark.parametrize("shape", [(4, 512, 1536), (3, 77, 1001)])
-def test_add_rmsnorm_matches_separate_ops(dtypes, shape):
+@pytest.mark.parametrize("dtypes", [(torch.float32, torch.float32), (torch.float16, torch.float32),
+                                    (torch.float16, torch.float16)])
+@pytest.mark.parametrize("shape", [(4, 300, 1536), (3, 77, 1001)])
+@pytest.mark.parametrize("sum_used", [True, False])
+def test_add_rmsnorm_matches_separate_ops(dtypes, shape, sum_used):
     from solution.residual import add_rmsnorm
     from solution.rmsnorm import rmsnorm
 
-    r_dtype, a_dtype, w_dtype = dtypes
-    s_dtype = torch.promote_types(r_dtype, a_dtype)
-    y_dtype = torch.promote_types(s_dtype, w_dtype)
+    x_dtype, w_dtype = dtypes
+    out_dtype = torch.promote_types(x_dtype, w_dtype)
     torch.manual_seed(0)
-    r0 = torch.randn(shape, device="cuda", dtype=r_dtype)
-    a0 = torch.randn(shape, device="cuda", dtype=a_dtype)
-    w = (torch.randn(shape[-1], device="cuda") * 0.5 + 1.0).to(w_dtype)
-    ds = torch.randn(shape, device="cuda", dtype=s_dtype)
-    dy = torch.randn(shape, device="cuda", dtype=y_dtype)
+    residual = torch.randn(shape, device="cuda", dtype=x_dtype)
+    branch = torch.randn(shape, device="cuda", dtype=x_dtype)
+    weight = (torch.randn(shape[-1], device="cuda") * 0.5 + 1.0).to(w_dtype)
+    grad_y = torch.randn(shape, device="cuda", dtype=out_dtype)
+    grad_s = torch.randn(shape, device="cuda", dtype=x_dtype)
 
-    r_ref = r0.clone().requires_grad_(True)
-    a_ref = a0.clone().requires_grad_(True)
-    s_ref = r_ref + a_ref
-    y_ref = rmsnorm(s_ref, w, 1e-6)
-    torch.autograd.backward([s_ref, y_ref], [ds, dy])
+    def run(fused):
+        r = residual.clone().requires_grad_(True)
+        b = branch.clone().requires_grad_(True)
+        if fused:
+            s, y = add_rmsnorm(r, b, weight, 1e-6)
+        else:
+            s = r + b
+            y = rmsnorm(s, weight, 1e-6)
+        outputs, grads = ([y, s], [grad_y, grad_s]) if sum_used else ([y], [grad_y])
+        torch.autograd.backward(outputs, grads)
+        return s.detach(), y.detach(), r.grad, b.grad
 
-    r = r0.clone().requires_grad_(True)
-    a = a0.clone().requires_grad_(True)
-    s, y = add_rmsnorm(r, a, w, 1e-6)
-    torch.autograd.backward([s, y], [ds, dy])
+    ref = run(fused=False)
+    out = run(fused=True)
 
-    assert s.dtype == s_ref.dtype and y.dtype == y_ref.dtype
-    assert r.grad.dtype == r_dtype and a.grad.dtype == a_dtype
-    tol = TOLERANCE[s_dtype]
-    torch.testing.assert_close(s.float(), s_ref.detach().float(), rtol=tol, atol=tol)
-    torch.testing.assert_close(y.float(), y_ref.detach().float(), rtol=tol, atol=tol)
-    # each gradient is compared at the precision of its own dtype: a last-bit difference before
-    # the final rounding may flip one fp16 rounding step in a few elements
-    r_tol, a_tol = TOLERANCE[r_dtype], TOLERANCE[a_dtype]
-    torch.testing.assert_close(r.grad.float(), r_ref.grad.float(), rtol=r_tol, atol=r_tol)
-    torch.testing.assert_close(a.grad.float(), a_ref.grad.float(), rtol=a_tol, atol=a_tol)
-    if a_dtype == torch.float16:
-        assert (a.grad != a_ref.grad).float().mean().item() < 1e-3
+    assert out[0].dtype == ref[0].dtype and out[1].dtype == ref[1].dtype == out_dtype
+    assert torch.equal(out[0], ref[0])  # the sum is the same fp32 / fp16 addition
+    tol = TOLERANCE[x_dtype]
+    for ours, theirs in zip(out[1:], ref[1:]):
+        torch.testing.assert_close(ours.float(), theirs.float(), rtol=tol, atol=tol)
+
+
+def test_patched_decoder_layer_matches_stock():
+    from transformers.models.qwen2 import modeling_qwen2 as modeling
+    from solution.residual import patch_qwen2_decoder_residual
+
+    config = modeling.Qwen2Config(vocab_size=200, hidden_size=64, intermediate_size=128,
+                                  num_hidden_layers=2, num_attention_heads=4,
+                                  num_key_value_heads=2, max_position_embeddings=128)
+    config._attn_implementation = "sdpa"
+    torch.manual_seed(0)
+    model = modeling.Qwen2Model(config).cuda().train()
+    ids = torch.randint(0, 200, (3, 40), device="cuda")
+
+    cls = modeling.Qwen2DecoderLayer
+    patch_qwen2_decoder_residual()
+    assert getattr(cls, "_own_residual", False), (
+        "the patch did not apply: Qwen2DecoderLayer.forward has another layout in this "
+        "transformers version (print inspect.getsource(Qwen2DecoderLayer.forward))")
+    patched, original = cls.forward, cls._own_residual_original
+
+    def run(forward):
+        cls.forward = forward
+        try:
+            model.zero_grad(set_to_none=True)
+            out = model(input_ids=ids, use_cache=False).last_hidden_state
+            (out ** 2).sum().backward()
+            return out.detach().clone(), model.embed_tokens.weight.grad.clone()
+        finally:
+            cls.forward = patched
+
+    ref_out, ref_grad = run(original)
+    out, grad = run(patched)
+    torch.testing.assert_close(out, ref_out, rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(grad, ref_grad, rtol=1e-3, atol=1e-4)
