@@ -15,7 +15,6 @@ The rules in short (the README and the task statement have the full ones):
 
 from .mlp import patch_qwen2_mlp_half
 from .nf4 import patch_bnb_dequantize
-from .residual import patch_qwen2_decoder_residual
 from .rmsnorm import patch_qwen2_rmsnorm
 from .unpad import patch_qwen2_unpad
 
@@ -23,6 +22,5 @@ from .unpad import patch_qwen2_unpad
 def apply():
     patch_qwen2_mlp_half()  # fp16 SwiGLU + MLP without fp32 detours
     patch_qwen2_rmsnorm()  # fused RMSNorm forward + backward
-    patch_qwen2_decoder_residual()  # residual add fused into the next RMSNorm
     patch_bnb_dequantize()  # NF4 dequantisation, double-quant decoded in-kernel
     patch_qwen2_unpad()  # run the model on real tokens only (no padding)
