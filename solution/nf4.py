@@ -7,9 +7,17 @@ Triton kernel and writes the fp16 weight once.
 
 Maths is exactly bitsandbytes':  w = nf4_table[nibble] * absmax,  where, for nested statistics,
 absmax = code2[uint8] * absmax2[block // 256] + offset.  Packing: the HIGH nibble of a byte is the
-first element, the LOW nibble the second.  The only possible difference to bitsandbytes is a fused
-multiply-add inside the nested absmax, i.e. at most one fp16 rounding step on a rare element.
+first element, the LOW nibble the second.  Without double quantisation the result is bit-identical.
+With it, the compiler fuses `code2 * absmax2 + offset` into one FMA, which can move the absmax by
+one fp32 ulp, i.e. at most one fp16 rounding step on a rare weight element.
+
+Two integration points (both are plain Python names looked up at call time):
+- `bitsandbytes.functional.dequantize_4bit`, used by MatMul4Bit.backward;
+- `bitsandbytes.backends.cuda.ops._dequant_linear_fallback`, used by the forward `gemm_4bit` op
+  whenever it dequantises and calls F.linear (every batch above 1536 tokens).
 """
+
+import importlib
 
 import torch
 import triton
@@ -23,6 +31,7 @@ _NF4_FALLBACK = [
     0.44070982933044434, 0.5626170039176941, 0.7229568362236023, 1.0,
 ]
 _TABLES = {}
+_FLOAT_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 BLOCK_BYTES = 512  # bytes per program = 1024 output elements
 
 
@@ -70,11 +79,36 @@ def _nf4_table(device):
     return table
 
 
-def _supported(quant_state):
+def dequantize_nf4_raw(packed, absmax, shape, dtype, blocksize, *, absmax2=None, code2=None,
+                       offset=None, blocksize2=256):
+    """Dequantise packed NF4 data. `absmax` holds the fp32 block scales, or, when `absmax2` is
+    given (double quantisation), their uint8 codes, decoded with `code2`, `absmax2` and `offset`."""
+    packed = packed.contiguous().view(-1)
+    out = torch.empty(tuple(shape), dtype=dtype, device=packed.device)
+    n_bytes, n_elems = packed.numel(), out.numel()
+    table = _nf4_table(packed.device)
+    nested = absmax2 is not None
+    if nested:
+        absmax = absmax.contiguous()
+        code2 = code2.float().contiguous()
+        absmax2 = absmax2.float().contiguous()
+        offset = offset.float().contiguous()
+    else:
+        absmax = absmax.float().contiguous()
+        code2 = absmax2 = offset = table  # unused placeholders
+        blocksize2 = 1
+    grid = (triton.cdiv(n_bytes, BLOCK_BYTES),)
+    nf4_dequant_kernel[grid](packed, absmax, code2, absmax2, offset, table, out, n_bytes, n_elems,
+                             BS_HALF=blocksize // 2, BS2=blocksize2, NESTED=nested,
+                             BLOCK=BLOCK_BYTES)
+    return out
+
+
+def _supported_state(quant_state):
     blocksize = getattr(quant_state, "blocksize", None)
     if not isinstance(blocksize, int) or blocksize < 2 or blocksize % 2:
         return False
-    if quant_state.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+    if quant_state.dtype not in _FLOAT_DTYPES:
         return False
     if getattr(quant_state, "nested", False):
         state2 = getattr(quant_state, "state2", None)
@@ -87,33 +121,18 @@ def _supported(quant_state):
 
 def dequantize_nf4(packed, quant_state):
     """Dequantise a packed NF4 weight to `quant_state.shape` in `quant_state.dtype`."""
-    packed = packed.contiguous().view(-1)
-    n_bytes = packed.numel()
-    out = torch.empty(quant_state.shape, dtype=quant_state.dtype, device=packed.device)
-    n_elems = out.numel()
-    table = _nf4_table(packed.device)
-    nested = bool(getattr(quant_state, "nested", False))
-    if nested:
+    if getattr(quant_state, "nested", False):
         state2 = quant_state.state2
-        absmax = quant_state.absmax.contiguous()
-        code2 = state2.code.float().contiguous()
-        absmax2 = state2.absmax.float().contiguous()
-        offset = quant_state.offset.float().contiguous()
-        bs2 = state2.blocksize
-    else:
-        absmax = quant_state.absmax.float().contiguous()
-        code2 = absmax2 = offset = table  # unused placeholders
-        bs2 = 1
-    grid = (triton.cdiv(n_bytes, BLOCK_BYTES),)
-    nf4_dequant_kernel[grid](packed, absmax, code2, absmax2, offset, table, out, n_bytes, n_elems,
-                             BS_HALF=quant_state.blocksize // 2, BS2=bs2, NESTED=nested,
-                             BLOCK=BLOCK_BYTES)
-    return out
+        return dequantize_nf4_raw(packed, quant_state.absmax, quant_state.shape,
+                                  quant_state.dtype, quant_state.blocksize, absmax2=state2.absmax,
+                                  code2=state2.code, offset=quant_state.offset,
+                                  blocksize2=state2.blocksize)
+    return dequantize_nf4_raw(packed, quant_state.absmax, quant_state.shape, quant_state.dtype,
+                              quant_state.blocksize)
 
 
-def patch_bnb_dequantize():
-    """Route bitsandbytes' `dequantize_4bit` (used by MatMul4Bit.backward) through our kernel for
-    NF4 weights. Anything unusual falls back to the original. Safe if bitsandbytes is a stub."""
+def _patch_functional():
+    """bitsandbytes.functional.dequantize_4bit -> our kernel for NF4 weights (backward pass)."""
     try:
         import bitsandbytes.functional as bnb_functional
         original = bnb_functional.dequantize_4bit
@@ -126,7 +145,7 @@ def patch_bnb_dequantize():
                         quant_type="fp4"):
         if (quant_state is not None and out is None and absmax is None
                 and getattr(quant_state, "quant_type", None) == "nf4"
-                and getattr(A, "is_cuda", False) and _supported(quant_state)):
+                and getattr(A, "is_cuda", False) and _supported_state(quant_state)):
             result = dequantize_nf4(A, quant_state)
             # same shim as bitsandbytes: a transposed packed weight returns the transposed result
             return result.t() if A.shape[0] == 1 else result
@@ -135,3 +154,43 @@ def patch_bnb_dequantize():
     dequantize_4bit._own_triton_nf4 = True
     dequantize_4bit._own_original = original
     bnb_functional.dequantize_4bit = dequantize_4bit
+
+
+def _patch_gemm_fallback():
+    """The CUDA `gemm_4bit` op (forward pass) dequantises through `_dequant_linear_fallback` and
+    then calls F.linear. Same GEMM, our dequantisation."""
+    try:
+        import bitsandbytes  # noqa: F401  (registers the backends)
+        ops = importlib.import_module("bitsandbytes.backends.cuda.ops")
+        original = ops._dequant_linear_fallback
+    except Exception:
+        return
+    if getattr(original, "_own_triton_nf4", False):
+        return
+
+    def _dequant_linear_fallback(A, B, shapeB, absmax, blocksize, quant_type, bias=None,
+                                 absmax_8bit=None, absmax_code=None, absmax_offset=None):
+        nested = absmax_8bit is not None
+        if (quant_type == "nf4" and getattr(A, "is_cuda", False) and A.dtype in _FLOAT_DTYPES
+                and isinstance(blocksize, int) and blocksize >= 2 and blocksize % 2 == 0
+                and (not nested or (absmax_code is not None and torch.is_tensor(absmax_offset)))):
+            if nested:
+                weight = dequantize_nf4_raw(B, absmax_8bit, shapeB, A.dtype, blocksize,
+                                            absmax2=absmax, code2=absmax_code,
+                                            offset=absmax_offset)
+            else:
+                weight = dequantize_nf4_raw(B, absmax, shapeB, A.dtype, blocksize)
+            return torch.nn.functional.linear(A, weight, bias)
+        return original(A, B, shapeB, absmax, blocksize, quant_type, bias, absmax_8bit,
+                        absmax_code, absmax_offset)
+
+    _dequant_linear_fallback._own_triton_nf4 = True
+    _dequant_linear_fallback._own_original = original
+    ops._dequant_linear_fallback = _dequant_linear_fallback
+
+
+def patch_bnb_dequantize():
+    """Use our NF4 kernel for every bitsandbytes dequantisation (forward and backward). Anything
+    unusual falls back to the original code. Safe if bitsandbytes is a stub."""
+    _patch_functional()
+    _patch_gemm_fallback()
