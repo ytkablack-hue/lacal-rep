@@ -97,14 +97,25 @@ def is_eligible(mlp, x):
         return False
 
 
-def half_forward(mlp, x):
-    """The MLP forward described in the module docstring. Assumes `is_eligible(mlp, x)`."""
+def _mlp_body(mlp, x):
     half = torch.float16
     # An fp16 input makes bitsandbytes return fp16 (it casts the output back to the INPUT dtype).
     # Two separate casts, as in the stock path, so the input gradient is summed exactly as before.
     gate = mlp.gate_proj(x.to(half))
     up = mlp.up_proj(x.to(half))
     return mlp.down_proj(swiglu_half(gate, up)).to(x.dtype)
+
+
+def half_forward(mlp, x):
+    """The MLP forward described in the module docstring. Assumes `is_eligible(mlp, x)`.
+
+    Recomputation of the three projections on backward (allowed by the task) drops the saved
+    gate/up activations (~1 GiB across layers) at the cost of extra GEMMs.
+    """
+    if x.requires_grad:
+        from torch.utils.checkpoint import checkpoint
+        return checkpoint(lambda h: _mlp_body(mlp, h), x, use_reentrant=False)
+    return _mlp_body(mlp, x)
 
 
 def patch_qwen2_mlp_half():
