@@ -15,7 +15,6 @@ def _fast_swiglu_kernel(
     g = tl.load(Gate_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
     u = tl.load(Up_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
     
-    # Быстрая математика SwiGLU без лишних аллокаций
     silu_g = g / (1.0 + tl.exp(-g))
     out = silu_g * u
     
