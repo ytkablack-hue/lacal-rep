@@ -98,7 +98,6 @@ def _eligible(model, input_ids, attention_mask, position_ids, past_key_values, i
 
 def patch_qwen2_unpad():
     """Qwen2Model.forward on packed real tokens. Safe if transformers is a stub."""
-    global _PACK
     try:
         from transformers.models.qwen2 import modeling_qwen2
         cls = modeling_qwen2.Qwen2Model
@@ -110,6 +109,8 @@ def patch_qwen2_unpad():
 
     def forward(self, input_ids=None, attention_mask=None, position_ids=None,
                 past_key_values=None, inputs_embeds=None, use_cache=None, **kwargs):
+        global _PACK  # assigned below: without this it is a local name (UnboundLocalError)
+
         def stock():
             return original(self, input_ids=input_ids, attention_mask=attention_mask,
                             position_ids=position_ids, past_key_values=past_key_values,
