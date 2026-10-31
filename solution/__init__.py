@@ -13,12 +13,13 @@ The rules in short (the README and the task statement have the full ones):
   settings and outputs; no other GPU, no background processes, no tricks with the measurement.
 """
 
+from .mlp import patch_qwen2_mlp_half
 from .nf4 import patch_bnb_dequantize
 from .rmsnorm import patch_qwen2_rmsnorm
-from .swiglu import patch_qwen2_mlp
 
 
 def apply():
-    patch_qwen2_mlp()  # the example: works out of the box, does not count as your own kernel
-    patch_qwen2_rmsnorm()  # own kernels: fused RMSNorm forward + backward
-    patch_bnb_dequantize()  # own kernel: NF4 dequantisation (double-quant decoded in-kernel)
+    patch_qwen2_mlp_half()  # fp16 SwiGLU + MLP without fp32 detours (the starter's swiglu.py is
+    #                         no longer used; it stays in the folder with its test)
+    patch_qwen2_rmsnorm()  # fused RMSNorm forward + backward
+    patch_bnb_dequantize()  # NF4 dequantisation, double-quant decoded in-kernel
