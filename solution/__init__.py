@@ -5,23 +5,20 @@ from solution.mlp import triton_swiglu_mlp
 
 def apply():
     """
-    Вызывается перед созданием модели и трейнера Soup.
-    Патчит слои модели безопасным образом, не нарушая работу тестов и проверок.
+    Интегрирует ядра в пайплайн Soup с проверкой типов для прохождения тестов.
     """
-    # 1. Патчим Qwen2RMSNorm
-    orig_rmsnorm_fwd = Qwen2RMSNorm.forward
-    def fast_rmsnorm_forward(self, hidden_states):
+    # 1. Патчим RMSNorm
+    orig_rmsnorm = Qwen2RMSNorm.forward
+    def patched_rmsnorm(self, hidden_states):
         if not isinstance(hidden_states, torch.Tensor) or hidden_states.device.type != 'cuda':
-            return orig_rmsnorm_fwd(self, hidden_states)
+            return orig_rmsnorm(self, hidden_states)
         return triton_rmsnorm(hidden_states, self.weight, self.variance_epsilon)
-    
-    Qwen2RMSNorm.forward = fast_rmsnorm_forward
+    Qwen2RMSNorm.forward = patched_rmsnorm
 
-    # 2. Патчим Qwen2MLP (Fused SwiGLU)
-    orig_mlp_fwd = Qwen2MLP.forward
-    def fast_mlp_forward(self, x):
+    # 2. Патчим MLP
+    orig_mlp = Qwen2MLP.forward
+    def patched_mlp(self, x):
         if not isinstance(x, torch.Tensor) or x.device.type != 'cuda':
-            return orig_mlp_fwd(self, x)
+            return orig_mlp(self, x)
         return triton_swiglu_mlp(self, x)
-
-    Qwen2MLP.forward = fast_mlp_forward
+    Qwen2MLP.forward = patched_mlp
