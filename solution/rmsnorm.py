@@ -27,7 +27,7 @@ def _fast_rmsnorm_kernel(
     y_ptrs = Y_ptr + row_idx * stride_y_row + col_offsets
     tl.store(y_ptrs, y.to(tl.float16), mask=mask)
 
-class FastRMSNorm(torch.autograd.Function):
+class FastRMSNormFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, weight, eps=1e-6):
         shape = x.shape
@@ -36,7 +36,7 @@ class FastRMSNorm(torch.autograd.Function):
         y_2d = torch.empty_like(x_2d)
         rsqrt = torch.empty(M, device=x.device, dtype=torch.float32)
         
-        BLOCK_SIZE = 4096 if N > 2048 else triton.next_power_of_2(N)
+        BLOCK_SIZE = triton.next_power_of_2(N)
         _fast_rmsnorm_kernel[(M,)](
             x_2d, y_2d, weight, rsqrt,
             x_2d.stride(0), y_2d.stride(0),
@@ -60,7 +60,7 @@ class FastRMSNorm(torch.autograd.Function):
         
         grad_x = rsqrt.unsqueeze(1) * w_grad_y - (rsqrt_3.unsqueeze(1) / N) * x_2d * sum_wx
         grad_weight = torch.sum(grad_2d * x_2d * rsqrt.unsqueeze(1), dim=0)
-        return grad_x.view(*shape).to(torch.float16), grad_weight.to(torch.float16), None
+        return grad_x.view(*shape).to(tl.float16 if hasattr(tl, 'float16') else torch.float16), grad_weight.to(torch.float16 if hasattr(tl, 'float16') else torch.float16), None
 
 def triton_rmsnorm(x, weight, eps=1e-6):
-    return FastRMSNorm.apply(x, weight, eps)
+    return FastRMSNormFunction.apply(x, weight, eps)

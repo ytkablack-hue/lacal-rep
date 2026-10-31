@@ -3,7 +3,7 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _fast_swiglu_kernel(
+def _swiglu_fused_kernel(
     Gate_ptr, Up_ptr, Out_ptr,
     n_elements,
     BLOCK_SIZE: tl.constexpr
@@ -15,6 +15,7 @@ def _fast_swiglu_kernel(
     g = tl.load(Gate_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
     u = tl.load(Up_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
     
+    # SwiGLU формулировка
     silu_g = g / (1.0 + tl.exp(-g))
     out = silu_g * u
     
@@ -26,10 +27,10 @@ def triton_swiglu_mlp(self, x):
     
     output = torch.empty_like(gate)
     n_elements = output.numel()
-    BLOCK_SIZE = 2048
+    BLOCK_SIZE = 4096
     grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
     
-    _fast_swiglu_kernel[grid](
+    _swiglu_fused_kernel[grid](
         gate, up, output,
         n_elements,
         BLOCK_SIZE=BLOCK_SIZE
