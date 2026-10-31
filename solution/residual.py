@@ -85,8 +85,10 @@ class AddRMSNormFunction(torch.autograd.Function):
         b2 = branch.reshape(-1, shape[-1]).contiguous()
         weight = weight.contiguous()
         n_rows, n_cols = r2.shape
-        s = torch.empty_like(r2)
-        y = torch.empty((n_rows, n_cols), dtype=torch.promote_types(r2.dtype, weight.dtype),
+        # the sum has the dtype the stock `residual + branch` gives (fp32 residual + fp16 branch -> fp32)
+        s_dtype = torch.promote_types(r2.dtype, b2.dtype)
+        s = torch.empty(r2.shape, dtype=s_dtype, device=r2.device)
+        y = torch.empty((n_rows, n_cols), dtype=torch.promote_types(s_dtype, weight.dtype),
                         device=r2.device)
         rstd = torch.empty(n_rows, dtype=torch.float32, device=r2.device)
         block, num_warps = _launch_config(n_cols)
@@ -95,6 +97,7 @@ class AddRMSNormFunction(torch.autograd.Function):
         s_out = s.view(shape)
         ctx.save_for_backward(s_out, weight, rstd)
         ctx.shape = shape
+        ctx.residual_dtype, ctx.branch_dtype = residual.dtype, branch.dtype
         return s_out, y.view(shape)
 
     @staticmethod
@@ -102,7 +105,8 @@ class AddRMSNormFunction(torch.autograd.Function):
         s, weight, rstd = ctx.saved_tensors
         n_cols = s.shape[-1]
         if dy is None:  # the normalised output was not used: only the sum's gradient flows
-            return ds, ds, None, None
+            return (ds.to(ctx.residual_dtype) if ds is not None else None,
+                    ds.to(ctx.branch_dtype) if ds is not None else None, None, None)
         s2 = s.reshape(-1, n_cols)
         dy2 = dy.reshape(-1, n_cols).contiguous()
         has_ds = ds is not None
@@ -116,7 +120,8 @@ class AddRMSNormFunction(torch.autograd.Function):
             xn = s2.float() * rstd[:, None]
             dw = (dy2.float() * xn).sum(0).to(weight.dtype)
         grad = dr.view(ctx.shape)
-        return grad, grad, dw, None
+        # the same gradient flows to both addends, in each one's own dtype (as autograd's add does)
+        return grad.to(ctx.residual_dtype), grad.to(ctx.branch_dtype), dw, None
 
 
 def add_rmsnorm(residual, branch, weight, eps):
@@ -234,7 +239,8 @@ def patch_qwen2_decoder_residual():
         residual = hidden_states
         attn = self.self_attn(hidden_states=self.input_layernorm(hidden_states), **call_kwargs)
         attn = attn[0] if isinstance(attn, tuple) else attn
-        if attn.dtype == residual.dtype and attn.shape == residual.shape and attn.is_cuda:
+        if (attn.shape == residual.shape and attn.is_cuda and attn.is_floating_point()
+                and residual.is_floating_point()):
             eps = getattr(norm, "variance_epsilon", getattr(norm, "eps", 1e-6))
             total, normed = add_rmsnorm(residual, attn, norm.weight, eps)
         else:

@@ -12,22 +12,26 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a C
 TOLERANCE = {torch.float16: 2e-3, torch.float32: 1e-5}
 
 
-@pytest.mark.parametrize("dtypes", [(torch.float32, torch.float32), (torch.float16, torch.float32),
-                                    (torch.float16, torch.float16)])
+# (residual, branch, weight): the real model has an fp32 residual stream and an fp16 attention output
+@pytest.mark.parametrize("dtypes", [(torch.float32, torch.float32, torch.float32),
+                                    (torch.float32, torch.float16, torch.float32),
+                                    (torch.float16, torch.float16, torch.float32),
+                                    (torch.float16, torch.float16, torch.float16)])
 @pytest.mark.parametrize("shape", [(4, 300, 1536), (3, 77, 1001)])
 @pytest.mark.parametrize("sum_used", [True, False])
 def test_add_rmsnorm_matches_separate_ops(dtypes, shape, sum_used):
     from solution.residual import add_rmsnorm
     from solution.rmsnorm import rmsnorm
 
-    x_dtype, w_dtype = dtypes
-    out_dtype = torch.promote_types(x_dtype, w_dtype)
+    x_dtype, b_dtype, w_dtype = dtypes
+    s_dtype = torch.promote_types(x_dtype, b_dtype)
+    out_dtype = torch.promote_types(s_dtype, w_dtype)
     torch.manual_seed(0)
     residual = torch.randn(shape, device="cuda", dtype=x_dtype)
-    branch = torch.randn(shape, device="cuda", dtype=x_dtype)
+    branch = torch.randn(shape, device="cuda", dtype=b_dtype)
     weight = (torch.randn(shape[-1], device="cuda") * 0.5 + 1.0).to(w_dtype)
     grad_y = torch.randn(shape, device="cuda", dtype=out_dtype)
-    grad_s = torch.randn(shape, device="cuda", dtype=x_dtype)
+    grad_s = torch.randn(shape, device="cuda", dtype=s_dtype)
 
     def run(fused):
         r = residual.clone().requires_grad_(True)
@@ -44,9 +48,10 @@ def test_add_rmsnorm_matches_separate_ops(dtypes, shape, sum_used):
     ref = run(fused=False)
     out = run(fused=True)
 
-    assert out[0].dtype == ref[0].dtype and out[1].dtype == ref[1].dtype == out_dtype
+    assert out[0].dtype == ref[0].dtype == s_dtype and out[1].dtype == ref[1].dtype == out_dtype
+    assert out[2].dtype == ref[2].dtype == x_dtype and out[3].dtype == ref[3].dtype == b_dtype
     assert torch.equal(out[0], ref[0])  # the sum is the same fp32 / fp16 addition
-    tol = TOLERANCE[x_dtype]
+    tol = max(TOLERANCE[x_dtype], TOLERANCE[b_dtype])
     for ours, theirs in zip(out[1:], ref[1:]):
         torch.testing.assert_close(ours.float(), theirs.float(), rtol=tol, atol=tol)
 
