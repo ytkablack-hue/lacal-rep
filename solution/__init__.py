@@ -21,9 +21,8 @@ from .unpad import patch_qwen2_unpad
 
 
 def apply():
-    patch_qwen2_mlp_half()  # fp16 SwiGLU + MLP without fp32 detours (the starter's swiglu.py is
-    #                         no longer used; it stays in the folder with its test)
+    patch_qwen2_mlp_half()  # fp16 SwiGLU + MLP without fp32 detours
     patch_qwen2_rmsnorm()  # fused RMSNorm forward + backward
-    patch_qwen2_decoder_residual()  # attention residual add fused into the next RMSNorm
+    patch_qwen2_decoder_residual()  # residual add fused into the next RMSNorm
     patch_bnb_dequantize()  # NF4 dequantisation, double-quant decoded in-kernel
-    patch_qwen2_unpad()  # decoder layers run on real tokens only (no padding inside a batch)
+    patch_qwen2_unpad()  # run the model on real tokens only (no padding)
