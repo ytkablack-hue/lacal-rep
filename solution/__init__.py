@@ -15,6 +15,7 @@ The rules in short (the README and the task statement have the full ones):
 
 from .mlp import patch_qwen2_mlp_half
 from .nf4 import patch_bnb_dequantize
+from .residual import patch_qwen2_decoder_residual
 from .rmsnorm import patch_qwen2_rmsnorm
 
 
@@ -22,4 +23,5 @@ def apply():
     patch_qwen2_mlp_half()  # fp16 SwiGLU + MLP without fp32 detours (the starter's swiglu.py is
     #                         no longer used; it stays in the folder with its test)
     patch_qwen2_rmsnorm()  # fused RMSNorm forward + backward
+    patch_qwen2_decoder_residual()  # attention residual add fused into the next RMSNorm
     patch_bnb_dequantize()  # NF4 dequantisation, double-quant decoded in-kernel
