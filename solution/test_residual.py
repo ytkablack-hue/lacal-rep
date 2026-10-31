@@ -45,5 +45,10 @@ def test_add_rmsnorm_matches_separate_ops(dtypes, shape):
     tol = TOLERANCE[s_dtype]
     torch.testing.assert_close(s.float(), s_ref.detach().float(), rtol=tol, atol=tol)
     torch.testing.assert_close(y.float(), y_ref.detach().float(), rtol=tol, atol=tol)
-    torch.testing.assert_close(r.grad.float(), r_ref.grad.float(), rtol=tol, atol=tol)
-    torch.testing.assert_close(a.grad.float(), a_ref.grad.float(), rtol=tol, atol=tol)
+    # each gradient is compared at the precision of its own dtype: a last-bit difference before
+    # the final rounding may flip one fp16 rounding step in a few elements
+    r_tol, a_tol = TOLERANCE[r_dtype], TOLERANCE[a_dtype]
+    torch.testing.assert_close(r.grad.float(), r_ref.grad.float(), rtol=r_tol, atol=r_tol)
+    torch.testing.assert_close(a.grad.float(), a_ref.grad.float(), rtol=a_tol, atol=a_tol)
+    if a_dtype == torch.float16:
+        assert (a.grad != a_ref.grad).float().mean().item() < 1e-3
